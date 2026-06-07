@@ -1,0 +1,12 @@
+# Local datasets
+datasets/**
+!datasets/
+!datasets/**/
+!datasets/README.md
+!datasets/**/.gitkeep
+
+# Experiment outputs
+outputs/**
+!outputs/
+!outputs/**/
+!outputs/**/.gitkeep
