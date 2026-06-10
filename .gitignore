@@ -10,3 +10,27 @@ outputs/**
 !outputs/
 !outputs/**/
 !outputs/**/.gitkeep
+
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Runtime logs
+runtime_logs/
+log/
+runs/
+*.log
+events.out.tfevents.*
+
+# Checkpoints
+checkpoint/
+checkpoints/
+*.pth
+*.pt
+*.ckpt
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
