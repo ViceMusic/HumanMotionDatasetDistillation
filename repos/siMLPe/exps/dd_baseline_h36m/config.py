@@ -25,7 +25,7 @@ C.root_dir = C.abs_dir[:C.abs_dir.index(C.repo_name) + len(C.repo_name)]
 
 
 C.log_dir = osp.abspath(osp.join(C.abs_dir, 'log'))
-C.snapshot_dir = osp.abspath(osp.join(C.log_dir, "snapshot"))
+C.snapshot_dir = osp.abspath(osp.join(C.abs_dir, "checkpoint"))
 
 
 exp_time = time.strftime('%Y_%m_%d_%H_%M_%S', time.localtime())

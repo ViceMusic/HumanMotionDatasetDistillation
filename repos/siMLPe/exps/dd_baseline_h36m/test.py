@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader
 
 # Manually edit these values before launching evaluation on the server.
 DATA_PATH = '/home/user/workspace/HumanMotionDatasetDistillation/datasets/processed/Human3.6m/h36m_expmap_sequences.npz'
-TEST_MODEL_PATH = 'log/snapshot/model-iter-40000.pth'
+TEST_MODEL_PATH = 'checkpoint/model-iter-40000.pth'
 
 
 results_keys = ['#2', '#4', '#8', '#10', '#14', '#18', '#22', '#25']
