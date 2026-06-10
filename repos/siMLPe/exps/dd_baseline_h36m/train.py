@@ -18,10 +18,13 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 
+# Manually edit these values before launching training on the server.
+DATA_PATH = '/home/user/workspace/HumanMotionDatasetDistillation/datasets/processed/Human3.6m/h36m_expmap_sequences.npz'
+ACC_LOG_PATH = 'log/dd_h36m_acc.txt'
+RESUME_MODEL_PATH = None
+
+
 parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-parser.add_argument('--exp-name', type=str, default=None, help='=exp name')
-parser.add_argument('--data-path', type=str, default=None, help='=processed h36m npz path')
-parser.add_argument('--model-pth', type=str, default=None, help='=checkpoint path for resume')
 parser.add_argument('--seed', type=int, default=888, help='=seed')
 parser.add_argument('--temporal-only', action='store_true', help='=temporal only')
 parser.add_argument('--layer-norm-axis', type=str, default='spatial', help='=layernorm axis')
@@ -32,18 +35,19 @@ parser.add_argument('--weight', type=float, default=1., help='=loss weight')
 
 args = parser.parse_args()
 
+config.dd_h36m_npz_path = DATA_PATH
+config.model_pth = RESUME_MODEL_PATH
+
 torch.use_deterministic_algorithms(True)
 torch.manual_seed(args.seed)
 writer = SummaryWriter()
 
-if args.data_path is not None:
-    config.dd_h36m_npz_path = args.data_path
-if args.model_pth is not None:
-    config.model_pth = args.model_pth
 ensure_dir(config.log_dir)
-if args.exp_name is None:
-    args.exp_name = os.path.join(config.log_dir, 'acc_last.txt')
-acc_log = open(args.exp_name, 'a')
+acc_log_path = ACC_LOG_PATH
+if not os.path.isabs(acc_log_path):
+    acc_log_path = os.path.join(config.abs_dir, acc_log_path)
+ensure_dir(os.path.dirname(acc_log_path))
+acc_log = open(acc_log_path, 'a')
 
 config.motion_fc_in.temporal_fc = args.temporal_only
 config.motion_fc_out.temporal_fc = args.temporal_only

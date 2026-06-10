@@ -11,6 +11,12 @@ from utils.misc import rotmat2xyz_torch, rotmat2euler_torch
 import torch
 from torch.utils.data import DataLoader
 
+
+# Manually edit these values before launching evaluation on the server.
+DATA_PATH = '/home/user/workspace/HumanMotionDatasetDistillation/datasets/processed/Human3.6m/h36m_expmap_sequences.npz'
+TEST_MODEL_PATH = 'log/snapshot/model-iter-40000.pth'
+
+
 results_keys = ['#2', '#4', '#8', '#10', '#14', '#18', '#22', '#25']
 
 def get_dct_matrix(N):
@@ -101,16 +107,16 @@ def test(config, model, dataloader) :
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
-    parser.add_argument('--model-pth', type=str, default=None, help='=encoder path')
-    parser.add_argument('--data-path', type=str, default=None, help='=processed h36m npz path')
     args = parser.parse_args()
 
-    if args.data_path is not None:
-        config.dd_h36m_npz_path = args.data_path
+    config.dd_h36m_npz_path = DATA_PATH
 
     model = Model(config)
 
-    state_dict = torch.load(args.model_pth)
+    model_pth = TEST_MODEL_PATH
+    if not os.path.isabs(model_pth):
+        model_pth = os.path.join(config.abs_dir, model_pth)
+    state_dict = torch.load(model_pth)
     model.load_state_dict(state_dict, strict=True)
     model.eval()
     model.cuda()
