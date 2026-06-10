@@ -141,7 +141,7 @@ dataset = DDH36MNPZDataset(config, 'train', config.data_aug)
 shuffle = True
 sampler = None
 dataloader = DataLoader(dataset, batch_size=config.batch_size,
-                        num_workers=config.num_workers, drop_last=True,
+                        num_workers=config.num_workers, drop_last=False,
                         sampler=sampler, shuffle=shuffle, pin_memory=True)
 
 eval_config = copy.deepcopy(config)
@@ -176,7 +176,7 @@ nb_iter = 0
 avg_loss = 0.
 avg_lr = 0.
 
-while (nb_iter + 1) < config.cos_lr_total_iters:
+while nb_iter < config.cos_lr_total_iters:
 
     for (h36m_motion_input, h36m_motion_target) in dataloader:
 
