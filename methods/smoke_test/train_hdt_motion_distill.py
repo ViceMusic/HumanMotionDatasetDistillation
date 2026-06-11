@@ -19,7 +19,10 @@ class DistillConfig:
     top_k: int = 16          # 取得前6个主频成分进行匹配，过多可能会引入噪声，过少可能无法捕捉动作特征，16是一个经验值，可以调整看看效果
     batch_size: int = 8      # 一次用八个窗口
     outer_steps: int = 100   # 训练的总步数，越多合成的时序可能越好，但也越慢，100是一个初始值，可以根据需要调整
+    num_backbones: int = 3   # 每个蒸馏step在几个随机初始化的backbone附近匹配梯度
+    backbone_reinit_interval: int = 20  # 每隔多少个step重新随机初始化一组backbone
     lr_synthetic: float = 1e-2
+    # 权重系数，可以根据实际情况调整，看看哪个损失对最终效果影响更大，或者是否需要引入更多的损失项（比如骨骼长度保持等物理约束）
     lambda_harm: float = 1.0
     lambda_grad: float = 1.0
     lambda_rigid: float = 0.0
@@ -229,6 +232,17 @@ def compute_gradient_matching_loss(backbone, real_past, real_future, syn_past, s
         denominator = denominator + real_grad.pow(2).sum()
     return numerator / (denominator + eps)
 
+
+def build_random_backbones(config, num_backbones, device):
+    backbones = []
+    for _ in range(num_backbones):
+        backbone = SiMLPeMotionBackbone(config).to(device)
+        backbone.train()
+        for param in backbone.parameters():
+            param.requires_grad_(True)
+        backbones.append(backbone)
+    return backbones
+
 # 这里从 SyntheticMotionBank 里取出所有 synthetic data。
 def save_synthetic_bank_npz(path, bank, step, logs, feature_type="expmap", feature_dim=99):
     """Save distilled motions with the same NPZ schema as processed H36M data."""
@@ -280,9 +294,8 @@ def train_distillation():
     sampler = RealSubseriesSampler(cfg.data_path, synthetic_len=cfg.synthetic_len)
     # 内置一个synthetic_motions: [num_actions, 100, 99]
     bank = SyntheticMotionBank(sampler.action_names, cfg.synthetic_len, cfg.feature_dim).to(device)
-    # 模型，然后调整为训练模式
-    backbone = SiMLPeMotionBackbone(simlpe_config).to(device)
-    backbone.train()
+    # 多个随机初始化backbone；只用于产生梯度匹配目标，不被optimizer更新。
+    backbones = build_random_backbones(simlpe_config, cfg.num_backbones, device)
 
     # 优化器和目录什么的
     optimizer = torch.optim.Adam(bank.parameters(), lr=cfg.lr_synthetic)
@@ -291,6 +304,9 @@ def train_distillation():
 
     logs = []
     for step in range(1, cfg.outer_steps + 1): # 这个相当于iter
+        if cfg.backbone_reinit_interval > 0 and step > 1 and (step - 1) % cfg.backbone_reinit_interval == 0:
+            backbones = build_random_backbones(simlpe_config, cfg.num_backbones, device)
+
         # 这里返回的是：
         # real_sub.shape = [B, 100, 99]
         # 以及actions是类型名称
@@ -311,8 +327,12 @@ def train_distillation():
         syn_past, syn_future = make_windows_from_subseries(syn_h, input_len, output_len, window_mode=cfg.window_mode)
 
         # 计算梯度匹配损失，预测损失，速度损失，刚性损失（目前是0），然后加权求和得到总损失
-        l_grad = compute_gradient_matching_loss(backbone, real_past, real_future, syn_past, syn_future, output_len)
-        syn_pred = backbone(syn_past, output_len=output_len)
+        grad_losses = [
+            compute_gradient_matching_loss(backbone, real_past, real_future, syn_past, syn_future, output_len)
+            for backbone in backbones
+        ]
+        l_grad = torch.stack(grad_losses).mean()
+        syn_pred = backbones[0](syn_past, output_len=output_len)
         l_pred_syn = prediction_loss(syn_pred, syn_future) # 这两个是原有的内容，让合成数据约束的合理一点
         l_vel_syn = velocity_loss(syn_pred, syn_future)
         l_rigid = compute_rigid_loss(syn_sub) # 这个暂时是0，如果以后有了有具体的刚性约束实现，可以在 compute_rigid_loss 里实现。
