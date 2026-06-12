@@ -298,13 +298,21 @@ def _some_variables():
 def fkl_torch(rotmat, parent, offset, rotInd, expmapInd):
     n = rotmat.data.shape[0]
     j_n = offset.shape[0]
-    p3d = torch.from_numpy(offset).float().to(rotmat.device).unsqueeze(0).repeat(n, 1, 1).clone()
+    offset_t = torch.from_numpy(offset).float().to(rotmat.device)
     R = rotmat.view(n, j_n, 3, 3)
+    rotations = [R[:, 0, :, :]]
+    positions = [offset_t[0].unsqueeze(0).repeat(n, 1)]
     for i in np.arange(1, j_n):
         if parent[i] > 0:
-            R[:, i, :, :] = torch.matmul(R[:, i, :, :], R[:, parent[i], :, :]).clone()
-            p3d[:, i, :] = torch.matmul(p3d[0, i, :], R[:, parent[i], :, :]) + p3d[:, parent[i], :]
-    return p3d
+            parent_rot = rotations[parent[i]]
+            current_rot = torch.matmul(R[:, i, :, :], parent_rot)
+            current_pos = torch.matmul(offset_t[i], parent_rot) + positions[parent[i]]
+        else:
+            current_rot = R[:, i, :, :]
+            current_pos = offset_t[i].unsqueeze(0).repeat(n, 1)
+        rotations.append(current_rot)
+        positions.append(current_pos)
+    return torch.stack(positions, dim=1)
 
 
 def expmap2rotmat_torch(r):
@@ -337,7 +345,8 @@ def expmap_to_xyz32(expmap):
 
     batch_size, seq_len, _ = expmap.shape
     pose_info = expmap.reshape(batch_size * seq_len, 33, 3).clone()
-    pose_info[:, :2] = 0
+    zeros = torch.zeros_like(pose_info[:, :2])
+    pose_info = torch.cat([zeros, pose_info[:, 2:]], dim=1)
     pose_info = pose_info.reshape(-1, 3)
     pose_info = expmap2rotmat_torch(pose_info).reshape(batch_size * seq_len, 33, 3, 3)[:, 1:]
     xyz_info = rotmat2xyz_torch(pose_info)
