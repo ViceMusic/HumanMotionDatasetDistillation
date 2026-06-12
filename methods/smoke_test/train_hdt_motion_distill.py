@@ -25,13 +25,13 @@ class DistillConfig:
     outer_steps: int = 100   # 训练的总步数，越多合成的时序可能越好，但也越慢，100是一个初始值，可以根据需要调整
     num_backbones: int = 3   # 每个蒸馏step在几个随机初始化的backbone附近匹配梯度
     backbone_reinit_interval: int = 20  # 每隔多少个step重新随机初始化一组backbone
-    lr_synthetic: float = 1e-2
+    lr_synthetic: float = 1e-3
     # 权重系数，可以根据实际情况调整，看看哪个损失对最终效果影响更大，或者是否需要引入更多的损失项（比如骨骼长度保持等物理约束）
-    lambda_harm: float = 1.0
-    lambda_grad: float = 1.0
+    lambda_harm: float = 0.1
+    lambda_grad: float = 0.1
     lambda_rigid: float = 0.0
-    lambda_vel: float = 1.0
-    lambda_pred: float = 1.0
+    lambda_vel: float = 10.0
+    lambda_pred: float = 10.0
     window_mode: str = "random"
     seed: int = 888
     save_name: str = "h36m_expmap_sequences_distilled.npz" # 合成后的时序数据保存文件名
@@ -144,7 +144,7 @@ class RealSubseriesSampler:
 # 找出真实动作里最主要的若干个频率成分，
 # 然后要求 synthetic sequence 在这些主要频率上的振幅和真实序列接近。
 # =======================================================================
-def compute_harmonic_loss(real_sub, synthetic_sub, top_k=16, p=2):
+def compute_harmonic_loss(real_sub, synthetic_sub, top_k=16, p=2, normalize=True, eps=1e-6):
     """Match rFFT amplitudes on real-data dominant harmonics.
 
     real_sub/synthetic_sub are expmap tensors shaped [B, M, 99].
@@ -153,6 +153,10 @@ def compute_harmonic_loss(real_sub, synthetic_sub, top_k=16, p=2):
     f_syn = torch.fft.rfft(synthetic_sub, dim=1)
     amp_real = torch.abs(f_real)
     amp_syn = torch.abs(f_syn)
+    if normalize:
+        scale = amp_real.detach().mean(dim=(1, 2), keepdim=True).clamp_min(eps)
+        amp_real = amp_real / scale
+        amp_syn = amp_syn / scale
     score = amp_real.detach().mean(dim=(0, 2))
     harmonic_idx = torch.topk(score, k=min(top_k, score.numel())).indices
     diff = amp_real[:, harmonic_idx, :] - amp_syn[:, harmonic_idx, :]
@@ -365,6 +369,7 @@ def train_distillation():
     save_path = os.path.join(output_dir, cfg.save_name)
 
     logs = []
+    recent_totals = []
     for step in range(1, cfg.outer_steps + 1): # 这个相当于iter
         if cfg.backbone_reinit_interval > 0 and step > 1 and (step - 1) % cfg.backbone_reinit_interval == 0:
             backbones = build_random_backbones(simlpe_config, cfg.num_backbones, device)
@@ -422,10 +427,14 @@ def train_distillation():
             "harmonics": harmonic_idx.detach().cpu().tolist(),
         }
         logs.append(row)
+        recent_totals.append(row["L_total"])
+        if len(recent_totals) > 20:
+            recent_totals.pop(0)
+        row["L_total_ma20"] = sum(recent_totals) / len(recent_totals)
         print(
             "step {step} L_harm={L_harm:.6f} L_grad={L_grad:.6f} "
             "L_pred_syn={L_pred_syn:.6f} L_vel_syn={L_vel_syn:.6f} "
-            "L_rigid={L_rigid:.6f} L_total={L_total:.6f}".format(**row)
+            "L_rigid={L_rigid:.6f} L_total={L_total:.6f} L_total_ma20={L_total_ma20:.6f}".format(**row)
         )
 
     save_synthetic_bank_npz(
