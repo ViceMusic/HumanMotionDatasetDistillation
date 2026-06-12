@@ -372,8 +372,11 @@ class SiMLPeMotionBackbone(nn.Module):
         return self.config.motion.h36m_target_length_train
 
     def forward(self, past_expmap, output_len=None):
-        output_len = self.output_len if output_len is None else output_len
         past_xyz = expmap_to_simlpe_xyz66(past_expmap)
+        return self.forward_xyz66(past_xyz, output_len=output_len)
+
+    def forward_xyz66(self, past_xyz, output_len=None):
+        output_len = self.output_len if output_len is None else output_len
         if self.config.deriv_input:
             model_in = torch.matmul(self.dct_m[:, :, : self.config.motion.h36m_input_length], past_xyz)
         else:
