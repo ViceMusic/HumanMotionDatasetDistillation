@@ -10,6 +10,10 @@ import torch.nn.functional as F
 from backbones.simlpe import SiMLPeMotionBackbone, build_simlpe_config, expmap_to_simlpe_xyz66
 
 
+DISTILL_SUBJECTS = ["S1", "S6", "S7", "S8", "S9", "S11"]  # 参与蒸馏训练的subject
+HELDOUT_SUBJECTS = ["S5"]  # 暂存并原样拼回最终npz、不参与蒸馏训练的subject
+
+
 @dataclass
 class DistillConfig:
     data_path: str = "/home/user/workspace/HumanMotionDatasetDistillation/datasets/processed/Human3.6m/h36m_expmap_sequences.npz"
@@ -49,6 +53,11 @@ def as_text(value):
     return str(value)
 
 
+def normalize_subject(value):
+    text = as_text(value)
+    return text if text.startswith("S") else "S{}".format(text)
+
+
 class SyntheticMotionBank(nn.Module):
     """One learnable expmap sub-series [100, 99] for each action category."""
 
@@ -76,13 +85,20 @@ class SyntheticMotionBank(nn.Module):
 class RealSubseriesSampler:
     """Samples action-balanced real expmap sub-series [B, 100, 99] from NPZ."""
 
-    def __init__(self, data_path, synthetic_len=100, train_subjects_only=True):
+    def __init__(self, data_path, synthetic_len=100, include_subjects=None, heldout_subjects=None):
         self.synthetic_len = synthetic_len
         self.by_action = {}
-        data = np.load(data_path, allow_pickle=True)
-        for subject, action, motion in zip(data["subjects"], data["actions"], data["motions"]):
-            subject_name = as_text(subject)
-            if train_subjects_only and subject_name in ("S5", "5"):
+        self.data = np.load(data_path, allow_pickle=True)
+        self.heldout_entries = []
+        include_subjects = set(include_subjects or [])
+        heldout_subjects = set(heldout_subjects or [])
+
+        for idx, (subject, action, motion) in enumerate(zip(self.data["subjects"], self.data["actions"], self.data["motions"])):
+            subject_name = normalize_subject(subject)
+            if subject_name in heldout_subjects:
+                self.heldout_entries.append(idx)
+                continue
+            if include_subjects and subject_name not in include_subjects:
                 continue
             motion = np.asarray(motion, dtype=np.float32)
             if motion.ndim != 2 or motion.shape[1] != 99 or motion.shape[0] < synthetic_len:
@@ -104,6 +120,22 @@ class RealSubseriesSampler:
             start = random.randint(0, seq.shape[0] - self.synthetic_len)
             subs.append(seq[start : start + self.synthetic_len])
         return torch.tensor(np.stack(subs), dtype=torch.float32), actions
+
+    def get_heldout_entries(self):
+        entries = []
+        for idx in self.heldout_entries:
+            motion = np.asarray(self.data["motions"][idx], dtype=np.float32)
+            entries.append(
+                {
+                    "subject": self.data["subjects"][idx],
+                    "action": self.data["actions"][idx],
+                    "trial": self.data["trials"][idx],
+                    "length": motion.shape[0],
+                    "raw_path": self.data["raw_paths"][idx],
+                    "motion": motion,
+                }
+            )
+        return entries
 
 # =======================================================================
 # 它把真实动作序列和合成动作序列都做 rFFT，
@@ -244,33 +276,58 @@ def build_random_backbones(config, num_backbones, device):
     return backbones
 
 # 这里从 SyntheticMotionBank 里取出所有 synthetic data。
-def save_synthetic_bank_npz(path, bank, step, logs, feature_type="expmap", feature_dim=99):
+def save_synthetic_bank_npz(
+    path,
+    bank,
+    step,
+    logs,
+    distill_subjects,
+    heldout_entries,
+    feature_type="expmap",
+    feature_dim=99,
+):
     """Save distilled motions with the same NPZ schema as processed H36M data."""
     ensure_dir(os.path.dirname(path))
     payload = bank.get_all()
     action_names = payload["action_names"]
     synthetic_motions = payload["synthetic_motions"].numpy().astype(np.float32)
 
-    subjects = np.array(["synthetic"] * len(action_names), dtype=object)
-    actions = np.array(action_names, dtype=object)
-    trials = np.array([1] * len(action_names), dtype=object)
-    lengths = np.array([motion.shape[0] for motion in synthetic_motions], dtype=np.int64)
-    raw_paths = np.array(
-        ["distilled://step_{}/{}_1".format(step, action) for action in action_names],
-        dtype=object,
-    )
-    motions = np.empty(len(action_names), dtype=object)
-    for idx, motion in enumerate(synthetic_motions):
-        motions[idx] = motion
+    subjects = []
+    actions = []
+    trials = []
+    lengths = []
+    raw_paths = []
+    motions = []
+
+    for subject in distill_subjects:
+        for action, motion in zip(action_names, synthetic_motions):
+            subjects.append(subject)
+            actions.append(action)
+            trials.append(1)
+            lengths.append(motion.shape[0])
+            raw_paths.append("distilled://step_{}/{}/{}_1".format(step, subject, action))
+            motions.append(motion)
+
+    for entry in heldout_entries:
+        subjects.append(entry["subject"])
+        actions.append(entry["action"])
+        trials.append(entry["trial"])
+        lengths.append(entry["length"])
+        raw_paths.append(entry["raw_path"])
+        motions.append(entry["motion"])
+
+    motion_array = np.empty(len(motions), dtype=object)
+    for idx, motion in enumerate(motions):
+        motion_array[idx] = motion
 
     np.savez(
         path,
-        subjects=subjects,
-        actions=actions,
-        trials=trials,
-        lengths=lengths,
-        raw_paths=raw_paths,
-        motions=motions,
+        subjects=np.array(subjects, dtype=object),
+        actions=np.array(actions, dtype=object),
+        trials=np.array(trials, dtype=object),
+        lengths=np.array(lengths, dtype=np.int64),
+        raw_paths=np.array(raw_paths, dtype=object),
+        motions=motion_array,
         feature_type=np.array(feature_type, dtype=object),
         feature_dim=np.array(feature_dim, dtype=np.int64),
         distill_step=np.array(step, dtype=np.int64),
@@ -291,7 +348,12 @@ def train_distillation():
 
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    sampler = RealSubseriesSampler(cfg.data_path, synthetic_len=cfg.synthetic_len)
+    sampler = RealSubseriesSampler(
+        cfg.data_path,
+        synthetic_len=cfg.synthetic_len,
+        include_subjects=DISTILL_SUBJECTS,
+        heldout_subjects=HELDOUT_SUBJECTS,
+    )
     # 内置一个synthetic_motions: [num_actions, 100, 99]
     bank = SyntheticMotionBank(sampler.action_names, cfg.synthetic_len, cfg.feature_dim).to(device)
     # 多个随机初始化backbone；只用于产生梯度匹配目标，不被optimizer更新。
@@ -366,7 +428,15 @@ def train_distillation():
             "L_rigid={L_rigid:.6f} L_total={L_total:.6f}".format(**row)
         )
 
-    save_synthetic_bank_npz(save_path, bank, cfg.outer_steps, logs, feature_dim=cfg.feature_dim)
+    save_synthetic_bank_npz(
+        save_path,
+        bank,
+        cfg.outer_steps,
+        logs,
+        distill_subjects=DISTILL_SUBJECTS,
+        heldout_entries=sampler.get_heldout_entries(),
+        feature_dim=cfg.feature_dim,
+    )
     print("Saved synthetic motion bank to {}".format(save_path))
 
 
