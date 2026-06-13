@@ -7,41 +7,65 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+try:
+    from torch.func import functional_call
+except ImportError:
+    from torch.nn.utils.stateless import functional_call
+
 from backbones.simlpe import SiMLPeMotionBackbone, build_simlpe_config, expmap_to_simlpe_xyz66
 
 
-DISTILL_SUBJECTS = ["S1", "S6", "S7", "S8", "S9", "S11"]  # 参与蒸馏训练的subject
-HELDOUT_SUBJECTS = ["S5"]  # 暂存并原样拼回最终npz、不参与蒸馏训练的subject
+'''
+1 backbone
+TM
+'''
+
+DISTILL_SUBJECTS = ["S1", "S6", "S7", "S8", "S9", "S11"]
+HELDOUT_SUBJECTS = ["S5"]
 
 
 @dataclass
 class DistillConfig:
     data_path: str = "/home/user/workspace/HumanMotionDatasetDistillation/datasets/processed/Human3.6m/h36m_expmap_sequences.npz"
     output_dir: str = "datasets"
-    synthetic_len: int = 100 # 合成的新时序的长度，必须 >= input_len + output_len, 还要考虑到模型采样本身
-    feature_dim: int = 99    # 数据的特征维度，H36M的expmap是99维的，backbone内部会自己调整，不用管
-    top_k: int = 16          # 取得前6个主频成分进行匹配，过多可能会引入噪声，过少可能无法捕捉动作特征，16是一个经验值，可以调整看看效果
-    batch_size: int = 128      # 一次用八个窗口
-    outer_steps: int = 16000   # 训练的总步数，越多合成的时序可能越好，但也越慢，100是一个初始值，可以根据需要调整
-    num_backbones: int = 3   # 每个蒸馏step在几个随机初始化的backbone附近匹配梯度
-    backbone_reinit_interval: int = 20  # 每隔多少个step重新随机初始化一组backbone
+
+    synthetic_len: int = 100
+    feature_dim: int = 99
+    top_k: int = 16
+
+    batch_size: int = 64
+    outer_steps: int = 8000
+
+    # 单一 backbone
+    num_backbones: int = 1
+
+    # 不重置 backbone
+    backbone_reinit_interval: int = 0
+
     lr_synthetic: float = 1e-2
-    # 权重系数，可以根据实际情况调整，看看哪个损失对最终效果影响更大，或者是否需要引入更多的损失项（比如骨骼长度保持等物理约束）
-    lambda_harm: float =0.01# 0.01  # 这个正常接近100了
+
+    lambda_harm: float = 0
     lambda_grad: float = 0.1
     lambda_rigid: float = 0.0
-    lambda_vel: float = 150 #150.0 # 这两个之前太大了
-    lambda_pred: float = 150 #150.0
+    lambda_vel: float = 0
+    lambda_pred: float = 0
+
+    # trajectory matching 内循环参数
+    inner_lr: float = 1e-3
+    real_inner_steps: int = 5
+    syn_inner_steps: int = 5
+
     window_mode: str = "random"
     seed: int = 888
-    save_name: str = "h36m_expmap_sequences_distilled_bs=128_iter=16000" # 合成后的时序数据保存文件名
 
-# 确保输出目录存在，如果不存在则创建
+    save_name: str = "h36m_expmap_sequences_distilled_bs=64_iter=8000_1backbone_no_reinit_traj"
+
+
 def ensure_dir(path):
     if path:
         os.makedirs(path, exist_ok=True)
 
-# 将可能是bytes的值转换为字符串，方便后续处理
+
 def as_text(value):
     value = np.asarray(value)
     if value.shape == ():
@@ -72,7 +96,10 @@ class SyntheticMotionBank(nn.Module):
         if isinstance(actions, torch.Tensor):
             action_ids = actions.to(self.synthetic_motions.device)
         else:
-            action_ids = torch.tensor([self.action_to_idx[str(a)] for a in actions], device=self.synthetic_motions.device)
+            action_ids = torch.tensor(
+                [self.action_to_idx[str(a)] for a in actions],
+                device=self.synthetic_motions.device,
+            )
         return self.synthetic_motions[action_ids]
 
     def get_all(self):
@@ -90,24 +117,38 @@ class RealSubseriesSampler:
         self.by_action = {}
         self.data = np.load(data_path, allow_pickle=True)
         self.heldout_entries = []
+
         include_subjects = set(include_subjects or [])
         heldout_subjects = set(heldout_subjects or [])
 
-        for idx, (subject, action, motion) in enumerate(zip(self.data["subjects"], self.data["actions"], self.data["motions"])):
+        for idx, (subject, action, motion) in enumerate(
+            zip(self.data["subjects"], self.data["actions"], self.data["motions"])
+        ):
             subject_name = normalize_subject(subject)
+
             if subject_name in heldout_subjects:
                 self.heldout_entries.append(idx)
                 continue
+
             if include_subjects and subject_name not in include_subjects:
                 continue
+
             motion = np.asarray(motion, dtype=np.float32)
+
             if motion.ndim != 2 or motion.shape[1] != 99 or motion.shape[0] < synthetic_len:
                 continue
+
             self.by_action.setdefault(as_text(action).lower(), []).append(motion)
 
         self.action_names = sorted(self.by_action.keys())
+
         if not self.action_names:
-            raise ValueError("No valid sequences with length >= {} found in {}".format(synthetic_len, data_path))
+            raise ValueError(
+                "No valid sequences with length >= {} found in {}".format(
+                    synthetic_len,
+                    data_path,
+                )
+            )
 
     def sample(self, batch_size, actions=None):
         if actions is None:
@@ -115,14 +156,17 @@ class RealSubseriesSampler:
             random.shuffle(actions)
 
         subs = []
+
         for action in actions:
             seq = random.choice(self.by_action[str(action)])
             start = random.randint(0, seq.shape[0] - self.synthetic_len)
             subs.append(seq[start : start + self.synthetic_len])
+
         return torch.tensor(np.stack(subs), dtype=torch.float32), actions
 
     def get_heldout_entries(self):
         entries = []
+
         for idx in self.heldout_entries:
             motion = np.asarray(self.data["motions"][idx], dtype=np.float32)
             entries.append(
@@ -135,15 +179,10 @@ class RealSubseriesSampler:
                     "motion": motion,
                 }
             )
+
         return entries
 
-# =======================================================================
-# 它把真实动作序列和合成动作序列都做 rFFT，
-# real_sub.shape      # [B, M, 99]
-# synthetic_sub.shape # [B, M, 99]
-# 找出真实动作里最主要的若干个频率成分，
-# 然后要求 synthetic sequence 在这些主要频率上的振幅和真实序列接近。
-# =======================================================================
+
 def compute_harmonic_loss(real_sub, synthetic_sub, top_k=16, p=2):
     """Match rFFT amplitudes on real-data dominant harmonics.
 
@@ -151,52 +190,61 @@ def compute_harmonic_loss(real_sub, synthetic_sub, top_k=16, p=2):
     """
     f_real = torch.fft.rfft(real_sub, dim=1)
     f_syn = torch.fft.rfft(synthetic_sub, dim=1)
+
     amp_real = torch.abs(f_real)
     amp_syn = torch.abs(f_syn)
+
     score = amp_real.detach().mean(dim=(0, 2))
     harmonic_idx = torch.topk(score, k=min(top_k, score.numel())).indices
+
     diff = amp_real[:, harmonic_idx, :] - amp_syn[:, harmonic_idx, :]
     loss = diff.abs().mean() if p == 1 else diff.pow(2).mean()
+
     return loss, harmonic_idx
 
-# =======================================================================
-# get_harmonic_reconstruction 本质上就是一个频域降噪 / 主成分提取函数，
-# 它不是梯度匹配的核心公式本身。
-# ======================================================================
+
 def get_harmonic_reconstruction(real_sub, synthetic_sub, top_k=16):
     """Reconstruct expmap sequences using real-data top-k rFFT harmonics."""
     seq_len = real_sub.shape[1]
+
     f_real = torch.fft.rfft(real_sub, dim=1)
     f_syn = torch.fft.rfft(synthetic_sub, dim=1)
+
     score = torch.abs(f_real).detach().mean(dim=(0, 2))
     harmonic_idx = torch.topk(score, k=min(top_k, score.numel())).indices
 
     real_filtered = torch.zeros_like(f_real)
     syn_filtered = torch.zeros_like(f_syn)
+
     real_filtered[:, harmonic_idx, :] = f_real[:, harmonic_idx, :]
     syn_filtered[:, harmonic_idx, :] = f_syn[:, harmonic_idx, :]
+
     return (
         torch.fft.irfft(real_filtered, n=seq_len, dim=1),
         torch.fft.irfft(syn_filtered, n=seq_len, dim=1),
         harmonic_idx,
     )
 
-# =======================================================================
-# 从一段长度为 100 的 motion sub-series 里切出姿态预测训练样本。
-# 例如 input_len=10, output_len=25 就是用前10帧预测后25帧。
-# 这里的窗口切法有两种，"first" 就是直接从开头切，"random" 就是在 [0, 100-10-25] 的范围内随机切。
-# =======================================================================
+
 def make_windows_from_subseries(series, input_len, output_len, num_windows=None, window_mode="random"):
     """Create expmap prediction windows using externally supplied siMLPe lengths."""
     batch_size, synthetic_len, _ = series.shape
     total_len = input_len + output_len
+
     if synthetic_len < total_len:
-        raise ValueError("synthetic_len={} is shorter than input_len + output_len={}".format(synthetic_len, total_len))
+        raise ValueError(
+            "synthetic_len={} is shorter than input_len + output_len={}".format(
+                synthetic_len,
+                total_len,
+            )
+        )
 
     windows_per_series = 1 if num_windows is None else num_windows
     max_start = synthetic_len - total_len
+
     past_windows = []
     future_windows = []
+
     for batch_idx in range(batch_size):
         for _ in range(windows_per_series):
             if window_mode == "first":
@@ -205,15 +253,14 @@ def make_windows_from_subseries(series, input_len, output_len, num_windows=None,
                 start = torch.randint(0, max_start + 1, (1,), device=series.device).item()
             else:
                 raise ValueError("Unknown window_mode: {}".format(window_mode))
+
             window = series[batch_idx, start : start + total_len]
             past_windows.append(window[:input_len])
             future_windows.append(window[input_len:total_len])
+
     return torch.stack(past_windows, dim=0), torch.stack(future_windows, dim=0)
 
-# =======================================================================
-# 计算预测损失和速度损失，都是 MSE 形式的。
-# 这里的 pred_xyz66 是 backbone 的输出，gt_future_expmap 是 ground truth 的 expmap，需要先转换成 xyz66 再计算损失。
-# =======================================================================
+
 def prediction_loss(pred_xyz66, gt_future_expmap):
     gt_xyz66 = expmap_to_simlpe_xyz66(gt_future_expmap)
     return F.mse_loss(pred_xyz66, gt_xyz66)
@@ -221,61 +268,177 @@ def prediction_loss(pred_xyz66, gt_future_expmap):
 
 def velocity_loss(pred_xyz66, gt_future_expmap):
     gt_xyz66 = expmap_to_simlpe_xyz66(gt_future_expmap)
+
     pred_vel = pred_xyz66[:, 1:] - pred_xyz66[:, :-1]
     gt_vel = gt_xyz66[:, 1:] - gt_xyz66[:, :-1]
+
     return F.mse_loss(pred_vel, gt_vel)
 
-#=======================================================================
-# 计算刚性损失，这里暂时返回0，因为我们没有具体的刚性约束实现。这个函数是为了后续扩展用的，如果你想加入一些骨骼长度保持或者其他物理约束，可以在这里实现。
-#=======================================================================
+
 def compute_rigid_loss(reference_tensor):
     return torch.zeros((), device=reference_tensor.device, dtype=reference_tensor.dtype)
 
-# ======================================================================
-# 这一步就是匹配一步梯度
-# 主要是匹配这两个玩意
-# 用真实数据训练 backbone 时产生的参数梯度
-# ≈
-# 用合成数据训练 backbone 时产生的参数梯度
-# =======================================================================
-def compute_gradient_matching_loss(backbone, real_past, real_future, syn_past, syn_future, output_len, eps=1e-8):
-    """One-step approximation of HDT/MTT trajectory matching.
 
-    Real gradients are the target update direction. Synthetic gradients keep graph
-    connectivity so SyntheticMotionBank can be optimized.
+def get_named_trainable_params(model):
+    return {
+        name: p
+        for name, p in model.named_parameters()
+        if p.requires_grad
+    }
+
+
+def get_named_buffers(model):
+    return {
+        name: b
+        for name, b in model.named_buffers()
+    }
+
+
+def model_forward_with_params(model, params, buffers, past, output_len):
+    state = {}
+    state.update(params)
+    state.update(buffers)
+
+    return functional_call(
+        model,
+        state,
+        (past,),
+        {"output_len": output_len},
+    )
+
+
+def inner_update(
+    model,
+    params,
+    buffers,
+    past,
+    future,
+    output_len,
+    inner_lr,
+    create_graph,
+):
+    pred = model_forward_with_params(
+        model,
+        params,
+        buffers,
+        past,
+        output_len,
+    )
+
+    loss = prediction_loss(pred, future) + velocity_loss(pred, future)
+
+    param_names = list(params.keys())
+    param_values = [params[name] for name in param_names]
+
+    grads = torch.autograd.grad(
+        loss,
+        param_values,
+        create_graph=create_graph,
+        allow_unused=True,
+    )
+
+    new_params = {}
+
+    for name, param, grad in zip(param_names, param_values, grads):
+        if grad is None:
+            new_params[name] = param
+        else:
+            new_params[name] = param - inner_lr * grad
+
+    return new_params, loss
+
+
+def compute_gradient_matching_loss(
+    backbone,
+    real_past,
+    real_future,
+    syn_past,
+    syn_future,
+    output_len,
+    inner_lr=1e-3,
+    real_steps=5,
+    syn_steps=5,
+    eps=1e-8,
+):
     """
-    params = [p for p in backbone.parameters() if p.requires_grad]
+    Trajectory matching version.
 
-    real_pred = backbone(real_past, output_len=output_len)
-    real_loss = prediction_loss(real_pred, real_future) + velocity_loss(real_pred, real_future)
-    g_real = torch.autograd.grad(real_loss, params, allow_unused=True)
-    g_real = [None if grad is None else grad.detach() for grad in g_real]
+    theta_real = T_i(theta, real_h)
+    theta_syn  = T_j(theta, syn_h)
 
-    syn_pred = backbone(syn_past, output_len=output_len)
-    syn_loss = prediction_loss(syn_pred, syn_future) + velocity_loss(syn_pred, syn_future)
-    g_syn = torch.autograd.grad(syn_loss, params, create_graph=True, allow_unused=True)
+    L_grad = ||theta_syn - theta_real||^2 / ||theta_0 - theta_real||^2
+    """
+    base_params = get_named_trainable_params(backbone)
+    buffers = get_named_buffers(backbone)
+
+    real_params = {
+        name: p.detach().clone().requires_grad_(True)
+        for name, p in base_params.items()
+    }
+
+    syn_params = {
+        name: p.detach().clone().requires_grad_(True)
+        for name, p in base_params.items()
+    }
+
+    for _ in range(real_steps):
+        real_params, _ = inner_update(
+            backbone,
+            real_params,
+            buffers,
+            real_past,
+            real_future,
+            output_len,
+            inner_lr,
+            create_graph=False,
+        )
+
+        real_params = {
+            name: p.detach().requires_grad_(True)
+            for name, p in real_params.items()
+        }
+
+    for _ in range(syn_steps):
+        syn_params, _ = inner_update(
+            backbone,
+            syn_params,
+            buffers,
+            syn_past,
+            syn_future,
+            output_len,
+            inner_lr,
+            create_graph=True,
+        )
 
     numerator = torch.zeros((), device=syn_past.device)
     denominator = torch.zeros((), device=syn_past.device)
-    for real_grad, syn_grad in zip(g_real, g_syn):
-        if real_grad is None or syn_grad is None:
-            continue
-        numerator = numerator + (syn_grad - real_grad).pow(2).sum()
-        denominator = denominator + real_grad.pow(2).sum()
+
+    for name in base_params.keys():
+        theta_0 = base_params[name].detach()
+        theta_real = real_params[name].detach()
+        theta_syn = syn_params[name]
+
+        numerator = numerator + (theta_syn - theta_real).pow(2).sum()
+        denominator = denominator + (theta_0 - theta_real).pow(2).sum()
+
     return numerator / (denominator + eps)
 
 
 def build_random_backbones(config, num_backbones, device):
     backbones = []
+
     for _ in range(num_backbones):
         backbone = SiMLPeMotionBackbone(config).to(device)
         backbone.train()
+
         for param in backbone.parameters():
             param.requires_grad_(True)
+
         backbones.append(backbone)
+
     return backbones
 
-# 这里从 SyntheticMotionBank 里取出所有 synthetic data。
+
 def save_synthetic_bank_npz(
     path,
     bank,
@@ -288,6 +451,7 @@ def save_synthetic_bank_npz(
 ):
     """Save distilled motions with the same NPZ schema as processed H36M data."""
     ensure_dir(os.path.dirname(path))
+
     payload = bank.get_all()
     action_names = payload["action_names"]
     synthetic_motions = payload["synthetic_motions"].numpy().astype(np.float32)
@@ -317,6 +481,7 @@ def save_synthetic_bank_npz(
         motions.append(entry["motion"])
 
     motion_array = np.empty(len(motions), dtype=object)
+
     for idx, motion in enumerate(motions):
         motion_array[idx] = motion
 
@@ -337,67 +502,133 @@ def save_synthetic_bank_npz(
 
 def train_distillation():
     cfg = DistillConfig()
+
     random.seed(cfg.seed)
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
 
-    # 设置backbone和预测输入输出（这里使用siMLPe作为基础内容）
     simlpe_config = build_simlpe_config()
     input_len = simlpe_config.motion.h36m_input_length
     output_len = simlpe_config.motion.h36m_target_length_train
 
-    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     sampler = RealSubseriesSampler(
         cfg.data_path,
         synthetic_len=cfg.synthetic_len,
         include_subjects=DISTILL_SUBJECTS,
         heldout_subjects=HELDOUT_SUBJECTS,
     )
-    # 内置一个synthetic_motions: [num_actions, 100, 99]
-    bank = SyntheticMotionBank(sampler.action_names, cfg.synthetic_len, cfg.feature_dim).to(device)
-    # 多个随机初始化backbone；只用于产生梯度匹配目标，不被optimizer更新。
-    backbones = build_random_backbones(simlpe_config, cfg.num_backbones, device)
 
-    # 优化器和目录什么的
-    optimizer = torch.optim.Adam(bank.parameters(), lr=cfg.lr_synthetic)
-    output_dir = cfg.output_dir if os.path.isabs(cfg.output_dir) else os.path.join(os.path.dirname(__file__), cfg.output_dir)
+    bank = SyntheticMotionBank(
+        sampler.action_names,
+        cfg.synthetic_len,
+        cfg.feature_dim,
+    ).to(device)
+
+    backbones = build_random_backbones(
+        simlpe_config,
+        cfg.num_backbones,
+        device,
+    )
+
+    optimizer = torch.optim.Adam(
+        bank.parameters(),
+        lr=cfg.lr_synthetic,
+    )
+
+    output_dir = (
+        cfg.output_dir
+        if os.path.isabs(cfg.output_dir)
+        else os.path.join(os.path.dirname(__file__), cfg.output_dir)
+    )
     save_path = os.path.join(output_dir, cfg.save_name)
 
     logs = []
-    for step in range(1, cfg.outer_steps + 1): # 这个相当于iter
-        if cfg.backbone_reinit_interval > 0 and step > 1 and (step - 1) % cfg.backbone_reinit_interval == 0:
-            backbones = build_random_backbones(simlpe_config, cfg.num_backbones, device)
 
-        # 这里返回的是：
-        # real_sub.shape = [B, 100, 99]
-        # 以及actions是类型名称
+    print("device:", device)
+    print("num_backbones:", cfg.num_backbones)
+    print("backbone_reinit_interval:", cfg.backbone_reinit_interval)
+    print("inner_lr:", cfg.inner_lr)
+    print("real_inner_steps:", cfg.real_inner_steps)
+    print("syn_inner_steps:", cfg.syn_inner_steps)
+    print("save_path:", save_path)
+
+    for step in range(1, cfg.outer_steps + 1):
+        if (
+            cfg.backbone_reinit_interval > 0
+            and step > 1
+            and (step - 1) % cfg.backbone_reinit_interval == 0
+        ):
+            backbones = build_random_backbones(
+                simlpe_config,
+                cfg.num_backbones,
+                device,
+            )
+
         real_sub, actions = sampler.sample(cfg.batch_size)
         real_sub = real_sub.to(device)
-        # 根据action获取同类别的合成数据片段，synthetic_sub.shape = [B, 100, 99]
+
         syn_sub = bank(actions)
 
-        # real_sub -> FFT -> 真实频谱 vs syn_sub  -> FFT -> 合成频谱
-        l_harm, harmonic_idx = compute_harmonic_loss(real_sub, syn_sub, top_k=cfg.top_k)
-        # 顺便算了一下降噪版本：只保留主要趋势/周期后的动作片段
-        real_h, syn_h, _ = get_harmonic_reconstruction(real_sub, syn_sub, top_k=cfg.top_k)
+        l_harm, harmonic_idx = compute_harmonic_loss(
+            real_sub,
+            syn_sub,
+            top_k=cfg.top_k,
+        )
 
-        # 切割窗口
-        # real_past:   [N, 50, 99]  real_future: [N, 10, 99]
-        # syn_past:    [N, 50, 99]  syn_future:  [N, 10, 99]
-        real_past, real_future = make_windows_from_subseries(real_h, input_len, output_len, window_mode=cfg.window_mode)
-        syn_past, syn_future = make_windows_from_subseries(syn_h, input_len, output_len, window_mode=cfg.window_mode)
+        real_h, syn_h, _ = get_harmonic_reconstruction(
+            real_sub,
+            syn_sub,
+            top_k=cfg.top_k,
+        )
 
-        # 计算梯度匹配损失，预测损失，速度损失，刚性损失（目前是0），然后加权求和得到总损失
+        real_past, real_future = make_windows_from_subseries(
+            real_h,
+            input_len,
+            output_len,
+            window_mode=cfg.window_mode,
+        )
+
+        syn_past, syn_future = make_windows_from_subseries(
+            syn_h,
+            input_len,
+            output_len,
+            window_mode=cfg.window_mode,
+        )
+
         grad_losses = [
-            compute_gradient_matching_loss(backbone, real_past, real_future, syn_past, syn_future, output_len)
+            compute_gradient_matching_loss(
+                backbone,
+                real_past,
+                real_future,
+                syn_past,
+                syn_future,
+                output_len,
+                inner_lr=cfg.inner_lr,
+                real_steps=cfg.real_inner_steps,
+                syn_steps=cfg.syn_inner_steps,
+            )
             for backbone in backbones
         ]
+
         l_grad = torch.stack(grad_losses).mean()
-        syn_pred = backbones[0](syn_past, output_len=output_len)
-        l_pred_syn = prediction_loss(syn_pred, syn_future) # 这两个是原有的内容，让合成数据约束的合理一点
-        l_vel_syn = velocity_loss(syn_pred, syn_future)
-        l_rigid = compute_rigid_loss(syn_sub) # 这个暂时是0，如果以后有了有具体的刚性约束实现，可以在 compute_rigid_loss 里实现。
+
+        syn_pred = backbones[0](
+            syn_past,
+            output_len=output_len,
+        )
+        l_pred_syn = prediction_loss(
+            syn_pred,
+            syn_future,
+        )
+        l_vel_syn = velocity_loss(
+            syn_pred,
+            syn_future,
+        )
+        l_rigid = compute_rigid_loss(
+            syn_sub,
+        )
 
         total_loss = (
             cfg.lambda_harm * l_harm
@@ -421,7 +652,9 @@ def train_distillation():
             "L_total": float(total_loss.detach().cpu()),
             "harmonics": harmonic_idx.detach().cpu().tolist(),
         }
+
         logs.append(row)
+
         if step % 10 == 0:
             print(
                 "step {step} L_harm={L_harm:.6f} L_grad={L_grad:.6f} "
@@ -438,6 +671,7 @@ def train_distillation():
         heldout_entries=sampler.get_heldout_entries(),
         feature_dim=cfg.feature_dim,
     )
+
     print("Saved synthetic motion bank to {}".format(save_path))
 
 
