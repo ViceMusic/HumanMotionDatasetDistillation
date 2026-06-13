@@ -9,16 +9,21 @@ from torch.utils.data import DataLoader, Dataset
 from backbones.simlpe import SiMLPeMotionBackbone, build_simlpe_config, expmap_to_simlpe_xyz66, expmap_to_xyz32
 
 
-TRAIN_NPZ_PATH = "datasets/h36m_expmap_sequences_distilled.npz"
-TEST_NPZ_PATH = "datasets/h36m_expmap_sequences_distilled.npz"
-LOG_PATH = "logs/train_acc.txt"
+# TRAIN_NPZ_PATH = "datasets/h36m_expmap_sequences_distilled.npz"
+# TEST_NPZ_PATH = "datasets/h36m_expmap_sequences_distilled.npz"
+
+TRAIN_NPZ_PATH="datasets/h36m_expmap_sequences_distilled_bs=64_iter=8000_1backbone_no_reinit_traj.npz"
+TEST_NPZ_PATH="/home/user/workspace/HumanMotionDatasetDistillation/datasets/processed/Human3.6m/h36m_expmap_sequences.npz"
+
+LOG_PATH = "logs/train_acc__bs64_iter8000.txt"
 
 TRAIN_SUBJECTS = ["S1", "S6", "S7", "S8", "S9", "S11"]
 TEST_SUBJECTS = ["S5"]
 
-BATCH_SIZE = 256
+sample_rate=1
+BATCH_SIZE = 64
 NUM_WORKERS = 4
-TOTAL_ITERS = 40000
+TOTAL_ITERS = 8000
 PRINT_EVERY = 100
 SEED = 888
 LR = 3e-4
@@ -68,7 +73,7 @@ def velocity_loss(pred_xyz66, gt_expmap):
 
 
 class H36MExpmapWindowDataset(Dataset):
-    def __init__(self, npz_path, subjects, input_len, output_len, shift_step=1, sample_rate=2):
+    def __init__(self, npz_path, subjects, input_len, output_len, shift_step=1, sample_rate=sample_rate):
         self.input_len = input_len
         self.output_len = output_len
         self.total_len = input_len + output_len
@@ -105,7 +110,7 @@ class H36MExpmapWindowDataset(Dataset):
 
 
 class H36MExpmapEvalDataset(Dataset):
-    def __init__(self, npz_path, subjects, input_len, output_len, shift_step=1, sample_rate=2):
+    def __init__(self, npz_path, subjects, input_len, output_len, shift_step=1, sample_rate=sample_rate):
         self.input_len = input_len
         self.output_len = output_len
         self.total_len = input_len + output_len
