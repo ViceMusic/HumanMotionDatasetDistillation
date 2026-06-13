@@ -34,3 +34,8 @@ checkpoints/
 .DS_Store
 .vscode/
 .idea/
+
+# smoke test
+methods/smoke_test/datasets/*.npz
+methods/smoke_test/logs/*.txt
+methods/smoke_test/*.log
