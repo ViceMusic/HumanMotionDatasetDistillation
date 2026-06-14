@@ -12,10 +12,10 @@ from backbones.simlpe import SiMLPeMotionBackbone, build_simlpe_config, expmap_t
 # TRAIN_NPZ_PATH = "datasets/h36m_expmap_sequences_distilled.npz"
 # TEST_NPZ_PATH = "datasets/h36m_expmap_sequences_distilled.npz"
 
-TRAIN_NPZ_PATH="datasets/h36m_expmap_sequences_distilled_bs=64_iter=8000_1backbone_no_reinit_traj.npz"
+TRAIN_NPZ_PATH="datasets/h36m_expmap_sequences_distilled_sequence_hdt_h001_g01_bs64_iter8000.npz"
 TEST_NPZ_PATH="/home/user/workspace/HumanMotionDatasetDistillation/datasets/processed/Human3.6m/h36m_expmap_sequences.npz"
 
-LOG_PATH = "logs/train_acc__bs64_iter8000.txt"
+LOG_PATH = "logs/train_acc_hdt_h001_g01_bs64_iter8000.txt"
 
 TRAIN_SUBJECTS = ["S1", "S6", "S7", "S8", "S9", "S11"]
 TEST_SUBJECTS = ["S5"]
