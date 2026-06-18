@@ -34,7 +34,7 @@ npz格式数据的封装说明
 
 ## ETT
 
-数据位置为：/home/user/workspace/HumanMotionDatasetDistillation/datasets/raw/ETT
+数据位置为：/home/user/workspace/HumanMotionDatasetDistillation/datasets/raw/ETT, 包括如下文件:
 * ETTh1.csv
 * ETTh2.csv
 * ETTm1.csv

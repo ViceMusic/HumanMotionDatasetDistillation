@@ -39,3 +39,6 @@ checkpoints/
 methods/smoke_test/datasets/*.npz
 methods/smoke_test/logs/*.txt
 methods/smoke_test/*.log
+
+# HDT test
+!!!HDT_DISTILLED_OUTPUT_PLACEHOLDER!!!/*.npz

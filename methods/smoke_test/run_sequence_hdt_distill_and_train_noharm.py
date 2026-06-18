@@ -45,7 +45,7 @@ class DistillConfig:
     feature_dim: int = 99
     top_k: int = 16
 
-    batch_size: int = 8
+    batch_size: int = 16
     outer_steps: int = 8000
 
     num_backbones: int = 3
@@ -54,8 +54,10 @@ class DistillConfig:
     lr_synthetic: float = 1e-2
 
     # fixed prior
-    lambda_harm: float = 0.01
+    lambda_harm: float = 0 # 暂时为0
     lambda_grad: float = 0.1
+    lambda_vel: float = 150.0
+    lambda_pred: float = 150.0
 
     window_mode: str = "random"
     seed: int = 888
@@ -474,6 +476,7 @@ def train_distillation():
     print("Num training sequences:", len(sampler.keys))
     print("Input length:", input_len, "Output length:", output_len)
     print("lambda_harm:", cfg.lambda_harm, "lambda_grad:", cfg.lambda_grad)
+    print("lambda_vel:", cfg.lambda_vel, "lambda_pred:", cfg.lambda_pred)
     print("Save path:", save_path)
 
     for step in range(1, cfg.outer_steps + 1):
@@ -487,6 +490,8 @@ def train_distillation():
         per_seq_losses = []
         per_seq_harms = []
         per_seq_grads = []
+        per_seq_preds = []
+        per_seq_vels = []
         harmonic_counts = []
 
         # Strict sequence-level loss:
@@ -528,11 +533,22 @@ def train_distillation():
             ]
             l_grad = torch.stack(grad_losses).mean()
 
-            loss_i = cfg.lambda_harm * l_harm + cfg.lambda_grad * l_grad
+            syn_pred = backbones[0](syn_past, output_len=output_len)
+            l_pred_syn = prediction_loss(syn_pred, syn_future)
+            l_vel_syn = velocity_loss(syn_pred, syn_future)
+
+            loss_i = (
+                cfg.lambda_harm * l_harm
+                + cfg.lambda_grad * l_grad
+                + cfg.lambda_pred * l_pred_syn
+                + cfg.lambda_vel * l_vel_syn
+            )
 
             per_seq_losses.append(loss_i)
             per_seq_harms.append(cfg.lambda_harm * l_harm.detach())
             per_seq_grads.append(cfg.lambda_grad * l_grad.detach())
+            per_seq_preds.append(cfg.lambda_pred * l_pred_syn.detach())
+            per_seq_vels.append(cfg.lambda_vel * l_vel_syn.detach())
             harmonic_counts.append(int(harmonic_mask.sum().detach().cpu()))
 
         total_loss = torch.stack(per_seq_losses).mean()
@@ -553,6 +569,8 @@ def train_distillation():
             "step": step,
             "L_harm": float(torch.stack(per_seq_harms).mean().detach().cpu()),
             "L_grad": float(torch.stack(per_seq_grads).mean().detach().cpu()),
+            "L_pred_syn": float(torch.stack(per_seq_preds).mean().detach().cpu()),
+            "L_vel_syn": float(torch.stack(per_seq_vels).mean().detach().cpu()),
             "L_total": float(total_loss.detach().cpu()),
             "syn_mean": syn_mean,
             "syn_std": syn_std,
@@ -568,6 +586,8 @@ def train_distillation():
                 "distill step {step} "
                 "L_harm={L_harm:.6f} "
                 "L_grad={L_grad:.6f} "
+                "L_pred_syn={L_pred_syn:.6f} "
+                "L_vel_syn={L_vel_syn:.6f} "
                 "L_total={L_total:.6f} "
                 "syn_mean={syn_mean:.6f} "
                 "syn_std={syn_std:.6f} "
