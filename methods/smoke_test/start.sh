@@ -13,5 +13,9 @@ mamba activate motiondd
 # nohup python run_sequence_hdt_distill_and_train.py > run_sequence_hdt_distill_and_train.log 2>&1 &
 # nohup python random_baseline.py > random_baseline.log 2>&1 &  # 随机
 
+#nohup python run_sequence_hdt_distill_and_train_realinit_fixedbackbone.py > run_sequence_hdt_distill_and_train_realinit_fixedbackbone.log 2>&1 & # 真实init 和 backbone固定
+
 # 知识蒸馏
-nohup python run_privileged_future_distill_and_train.py > run_privileged_future_distill_and_train.log 2>&1 &
+# nohup python run_privileged_future_distill_and_train.py > run_privileged_future_distill_and_train.log 2>&1 &
+# nohup python run_privileged_future_stgraph_distill_and_train.py > run_privileged_future_stgraph_distill_and_train.log 2>&1 &  # 初步修改
+nohup python run_privileged_future_stgraph_weighted_distill_and_train.py > run_privileged_future_stgraph_weighted_distill_and_train.log 2>&1 &
