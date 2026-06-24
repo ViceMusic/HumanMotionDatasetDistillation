@@ -40,5 +40,10 @@ methods/smoke_test/datasets/*.npz
 methods/smoke_test/logs/*.txt
 methods/smoke_test/*.log
 
+# shapelet test
+methods/shapelet_test/datasets/*.npz
+methods/shapelet_test/logs/*.txt
+methods/shapelet_test/*.log
+
 # HDT test
 !!!HDT_DISTILLED_OUTPUT_PLACEHOLDER!!!/*.npz

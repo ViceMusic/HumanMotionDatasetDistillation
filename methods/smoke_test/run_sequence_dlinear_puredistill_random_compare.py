@@ -9,31 +9,38 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, Sampler
 
 from backbones.simlpe import (
-    SiMLPeMotionBackbone,
     build_simlpe_config,
-    expmap_to_simlpe_xyz66,
     expmap_to_xyz32,
 )
 
 
 # ============================================================
-# Sequence-level parallel HDT-style motion distillation + train
+# Sequence-level DLinear motion distillation + random baselines
+#
 # Save as:
-#   methods/smoke_test/run_sequence_hdt_distill_and_train.py
+#   methods/smoke_test/run_sequence_dlinear_distill_random_compare.py
 #
 # Run:
-#   python methods/smoke_test/run_sequence_hdt_distill_and_train.py
+#   python methods/smoke_test/run_sequence_dlinear_distill_random_compare.py
 #
-# Core rule:
-#   One real sequence has one synthetic sequence.
-#   loss(real_seq_i, syn_seq_i) only updates syn_seq_i.
-#   No action-level averaging, no subject-action bank.
+# What this script does:
+#   1. Replace SiMLPe surrogate/train backbone with a simple DLinear.
+#   2. Keep the sequence-level distillation rule:
+#      one real sequence has one synthetic sequence.
+#   3. Generate random baselines with the same sequence bank format:
+#      - random_complete: one contiguous 100-frame crop
+#      - random_20pieces: 20 random pieces concatenated into 100 frames
+#      - random_50pieces: 50 random pieces concatenated into 100 frames
+#   4. Train/evaluate DLinear on distilled + all random baselines.
+#   5. Print one unified final summary.
 # ============================================================
 
 
 DISTILL_SUBJECTS = ["S1", "S6", "S7", "S8", "S9", "S11"]
 HELDOUT_SUBJECTS = ["S5"]
 TEST_SUBJECTS = ["S5"]
+
+RESULT_KEYS = ["#2", "#4", "#8", "#10", "#14", "#18", "#22", "#25"]
 
 
 @dataclass
@@ -44,26 +51,26 @@ class DistillConfig:
     synthetic_len: int = 100
     feature_dim: int = 99
     top_k: int = 16
+    use_hdt_filter: bool = False
 
     batch_size: int = 16
     outer_steps: int = 8000
 
-    num_backbones: int = 3
-    backbone_reinit_interval: int = 0  # 0 means fixed random backbones, no reinitialization during distillation
+    num_backbones: int = 1
+    backbone_reinit_interval: int = 0
 
     lr_synthetic: float = 1e-2
 
-    # fixed prior
-    lambda_harm: float = 0 # 暂时为0
+    lambda_harm: float = 0.0
     lambda_grad: float = 0.1
-    lambda_vel: float = 150.0
-    lambda_pred: float = 150.0
+    lambda_vel: float = 0.0
+    lambda_pred: float = 0.0
 
     window_mode: str = "random"
     seed: int = 888
     print_interval: int = 10
 
-    save_name: str = "h36m_expmap_sequences_distilled_sequence_hdt_h001_g01_bs64_iter8000.npz"
+    save_name: str = "h36m_expmap_sequences_puredistilled_sequence_dlinear_raw_g01_bs16_iter8000.npz"
 
 
 @dataclass
@@ -71,8 +78,7 @@ class TrainConfig:
     train_npz_path: str = ""
     test_npz_path: str = "/home/user/workspace/HumanMotionDatasetDistillation/datasets/processed/Human3.6m/h36m_expmap_sequences.npz"
 
-    log_path: str = "logs/train_sequence_hdt_h001_g01_bs64_iter8000.txt"
-
+    log_dir: str = "logs"
     train_subjects = DISTILL_SUBJECTS
     test_subjects = TEST_SUBJECTS
 
@@ -84,14 +90,6 @@ class TrainConfig:
     seed: int = 888
     lr: float = 3e-4
     weight_decay: float = 1e-4
-
-
-RESULT_KEYS = ["#2", "#4", "#8", "#10", "#14", "#18", "#22", "#25"]
-JOINT_USED_XYZ = np.array(
-    [2, 3, 4, 5, 7, 8, 9, 10, 12, 13, 14, 15, 17, 18, 19, 21, 22, 25, 26, 27, 29, 30]
-).astype(np.int64)
-JOINT_TO_IGNORE = np.array([16, 20, 23, 24, 28, 31]).astype(np.int64)
-JOINT_EQUAL = np.array([13, 19, 22, 13, 27, 30]).astype(np.int64)
 
 
 def root_dir():
@@ -131,13 +129,93 @@ def make_seq_key(idx, subject, action, trial, raw_path):
     return "{}::{}::{}::{}".format(idx, subject, action, trial), subject, action, trial, raw_path
 
 
+class MovingAvg(nn.Module):
+    def __init__(self, kernel_size, stride=1):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.avg = nn.AvgPool1d(kernel_size=kernel_size, stride=stride, padding=0)
+
+    def forward(self, x):
+        # x: [B, T, C]
+        if self.kernel_size <= 1:
+            return x
+        pad_front = x[:, 0:1, :].repeat(1, (self.kernel_size - 1) // 2, 1)
+        pad_end = x[:, -1:, :].repeat(1, (self.kernel_size - 1) // 2, 1)
+        x = torch.cat([pad_front, x, pad_end], dim=1)
+        x = self.avg(x.permute(0, 2, 1)).permute(0, 2, 1)
+        return x
+
+
+class SeriesDecomp(nn.Module):
+    def __init__(self, kernel_size):
+        super().__init__()
+        self.moving_avg = MovingAvg(kernel_size)
+
+    def forward(self, x):
+        moving_mean = self.moving_avg(x)
+        residual = x - moving_mean
+        return residual, moving_mean
+
+
+class DLinearMotionBackbone(nn.Module):
+    """
+    Simple DLinear for motion expmap forecasting.
+
+    Input:
+        past_expmap: [B, input_len, 99]
+    Output:
+        pred_expmap: [B, output_len, 99]
+
+    This is intentionally plain. It predicts expmap directly; evaluation converts
+    the predicted expmap sequence to xyz32 for MPJPE.
+    """
+
+    def __init__(self, input_len, output_len, feature_dim=99, moving_avg=25, individual=False):
+        super().__init__()
+        self.input_len = input_len
+        self.output_len = output_len
+        self.feature_dim = feature_dim
+        self.individual = individual
+        self.decomp = SeriesDecomp(moving_avg)
+
+        if individual:
+            self.linear_seasonal = nn.ModuleList([nn.Linear(input_len, output_len) for _ in range(feature_dim)])
+            self.linear_trend = nn.ModuleList([nn.Linear(input_len, output_len) for _ in range(feature_dim)])
+            for i in range(feature_dim):
+                self.linear_seasonal[i].weight.data.fill_(1.0 / input_len)
+                self.linear_trend[i].weight.data.fill_(1.0 / input_len)
+        else:
+            self.linear_seasonal = nn.Linear(input_len, output_len)
+            self.linear_trend = nn.Linear(input_len, output_len)
+            self.linear_seasonal.weight.data.fill_(1.0 / input_len)
+            self.linear_trend.weight.data.fill_(1.0 / input_len)
+
+    def forward(self, past_expmap, output_len=None):
+        if output_len is not None and output_len != self.output_len:
+            raise ValueError("DLinear was built for output_len={}, got {}".format(self.output_len, output_len))
+
+        seasonal_init, trend_init = self.decomp(past_expmap)
+        seasonal_init = seasonal_init.permute(0, 2, 1)  # [B, C, T]
+        trend_init = trend_init.permute(0, 2, 1)
+
+        if self.individual:
+            seasonal_output = torch.zeros(
+                [seasonal_init.size(0), self.feature_dim, self.output_len],
+                dtype=seasonal_init.dtype,
+                device=seasonal_init.device,
+            )
+            trend_output = torch.zeros_like(seasonal_output)
+            for i in range(self.feature_dim):
+                seasonal_output[:, i, :] = self.linear_seasonal[i](seasonal_init[:, i, :])
+                trend_output[:, i, :] = self.linear_trend[i](trend_init[:, i, :])
+        else:
+            seasonal_output = self.linear_seasonal(seasonal_init)
+            trend_output = self.linear_trend(trend_init)
+
+        return (seasonal_output + trend_output).permute(0, 2, 1)  # [B, output_len, C]
+
+
 class SequenceFrequencySyntheticMotionBank(nn.Module):
-    """
-    Frequency-domain synthetic bank indexed by original training sequence id.
-
-    Row k corresponds to one real sequence, not one action and not one subject-action pair.
-    """
-
     def __init__(self, seq_infos, synthetic_len=100, feature_dim=99, init_motion=None, init_std=0.02):
         super().__init__()
         self.seq_infos = list(seq_infos)
@@ -152,15 +230,9 @@ class SequenceFrequencySyntheticMotionBank(nn.Module):
             init_motion = torch.as_tensor(init_motion, dtype=torch.float32)
             expected_shape = (len(self.keys), synthetic_len, feature_dim)
             if tuple(init_motion.shape) != expected_shape:
-                raise ValueError(
-                    "init_motion shape {} does not match expected {}".format(
-                        tuple(init_motion.shape),
-                        expected_shape,
-                    )
-                )
+                raise ValueError("init_motion shape {} does not match expected {}".format(tuple(init_motion.shape), expected_shape))
 
         init_freq = torch.fft.rfft(init_motion, dim=1)
-
         self.freq_real = nn.Parameter(init_freq.real)
         self.freq_imag = nn.Parameter(init_freq.imag)
 
@@ -172,11 +244,7 @@ class SequenceFrequencySyntheticMotionBank(nn.Module):
 
     def forward(self, keys):
         all_motion = self.get_time()
-        ids = torch.tensor(
-            [self.key_to_idx[str(key)] for key in keys],
-            device=all_motion.device,
-            dtype=torch.long,
-        )
+        ids = torch.tensor([self.key_to_idx[str(key)] for key in keys], device=all_motion.device, dtype=torch.long)
         return all_motion[ids]
 
     @torch.no_grad()
@@ -193,11 +261,6 @@ class SequenceFrequencySyntheticMotionBank(nn.Module):
 
 
 class SequenceRealSubseriesSampler:
-    """
-    Samples from individual real sequences.
-    Each key maps to exactly one original sequence.
-    """
-
     def __init__(self, data_path, synthetic_len=100, include_subjects=None, heldout_subjects=None):
         self.synthetic_len = synthetic_len
         self.data = np.load(data_path, allow_pickle=True)
@@ -226,15 +289,12 @@ class SequenceRealSubseriesSampler:
 
             if include_subjects and subject_name not in include_subjects:
                 continue
-
             if motion.ndim != 2 or motion.shape[1] != 99:
                 continue
             if motion.shape[0] < synthetic_len:
                 continue
 
-            key, subject_name, action_name, trial_name, raw_path_text = make_seq_key(
-                idx, subject_name, action, trial, raw_path
-            )
+            key, subject_name, action_name, trial_name, raw_path_text = make_seq_key(idx, subject_name, action, trial, raw_path)
             self.by_key[key] = motion
             self.seq_infos.append(
                 {
@@ -248,7 +308,6 @@ class SequenceRealSubseriesSampler:
             )
 
         self.keys = [info["key"] for info in self.seq_infos]
-
         if not self.keys:
             raise ValueError("No valid training sequences with length >= {} found in {}".format(synthetic_len, data_path))
 
@@ -267,10 +326,6 @@ class SequenceRealSubseriesSampler:
         return torch.tensor(np.stack(subs), dtype=torch.float32), keys
 
     def get_initial_subseries(self):
-        """
-        Initialize each synthetic sequence with one real crop from the same original sequence.
-        The order strictly follows self.seq_infos, so it matches SequenceFrequencySyntheticMotionBank rows.
-        """
         subs = []
         for info in self.seq_infos:
             key = info["key"]
@@ -301,7 +356,6 @@ def build_channelwise_harmonic_mask(real_sub, top_k=16):
     score = torch.abs(f_real).detach().mean(dim=0)
     m_fft, c = score.shape
     k = min(top_k, m_fft)
-
     idx = torch.topk(score, k=k, dim=0).indices
     mask = torch.zeros_like(score, dtype=torch.bool)
     channel_ids = torch.arange(c, device=real_sub.device).view(1, c).expand(k, c)
@@ -311,33 +365,25 @@ def build_channelwise_harmonic_mask(real_sub, top_k=16):
 
 def harmonic_filter_and_loss(real_sub, syn_sub, top_k=16):
     seq_len = real_sub.shape[1]
-
     f_real = torch.fft.rfft(real_sub, dim=1)
     f_syn = torch.fft.rfft(syn_sub, dim=1)
-
     mask = build_channelwise_harmonic_mask(real_sub, top_k=top_k)
-
     f_real_h = torch.where(mask, f_real, torch.zeros_like(f_real))
     f_syn_h = torch.where(mask, f_syn, torch.zeros_like(f_syn))
-
     l_harm = (torch.abs(f_real_h.detach()) - torch.abs(f_syn_h)).pow(2).mean()
-
     real_h = torch.fft.irfft(f_real_h, n=seq_len, dim=1)
     syn_h = torch.fft.irfft(f_syn_h, n=seq_len, dim=1)
-
     return l_harm, real_h, syn_h, mask
 
 
 def make_windows_from_subseries(series, input_len, output_len, num_windows=None, window_mode="random"):
     batch_size, synthetic_len, _ = series.shape
     total_len = input_len + output_len
-
     if synthetic_len < total_len:
         raise ValueError("synthetic_len={} is shorter than input_len+output_len={}".format(synthetic_len, total_len))
 
     windows_per_series = 1 if num_windows is None else num_windows
     max_start = synthetic_len - total_len
-
     past_windows = []
     future_windows = []
 
@@ -357,30 +403,22 @@ def make_windows_from_subseries(series, input_len, output_len, num_windows=None,
     return torch.stack(past_windows, dim=0), torch.stack(future_windows, dim=0)
 
 
-def prediction_loss(pred_xyz66, gt_future_expmap):
-    gt_xyz66 = expmap_to_simlpe_xyz66(gt_future_expmap)
-    return F.mse_loss(pred_xyz66, gt_xyz66)
+def prediction_loss_expmap(pred_expmap, gt_future_expmap):
+    return F.mse_loss(pred_expmap, gt_future_expmap)
 
 
-def velocity_loss(pred_xyz66, gt_future_expmap):
-    gt_xyz66 = expmap_to_simlpe_xyz66(gt_future_expmap)
-    pred_vel = pred_xyz66[:, 1:] - pred_xyz66[:, :-1]
-    gt_vel = gt_xyz66[:, 1:] - gt_xyz66[:, :-1]
+def velocity_loss_expmap(pred_expmap, gt_future_expmap):
+    pred_vel = pred_expmap[:, 1:] - pred_expmap[:, :-1]
+    gt_vel = gt_future_expmap[:, 1:] - gt_future_expmap[:, :-1]
     return F.mse_loss(pred_vel, gt_vel)
 
 
 def compute_prediction_objective(backbone, past, future, output_len):
     pred = backbone(past, output_len=output_len)
-    return prediction_loss(pred, future) + velocity_loss(pred, future)
+    return prediction_loss_expmap(pred, future) + velocity_loss_expmap(pred, future)
 
 
 def compute_gradient_matching_loss_single(backbone, real_past, real_future, syn_past, syn_future, output_len, eps=1e-8):
-    """
-    Single-sequence gradient matching.
-
-    This function receives windows from one real sequence and one synthetic sequence only.
-    No cross-sequence aggregated gradient is used.
-    """
     params = [p for p in backbone.parameters() if p.requires_grad]
 
     real_loss = compute_prediction_objective(backbone, real_past, real_future, output_len)
@@ -402,10 +440,10 @@ def compute_gradient_matching_loss_single(backbone, real_past, real_future, syn_
     return numerator / (denominator + eps)
 
 
-def build_random_backbones(config, num_backbones, device):
+def build_random_dlinear_backbones(input_len, output_len, feature_dim, num_backbones, device):
     backbones = []
     for _ in range(num_backbones):
-        backbone = SiMLPeMotionBackbone(config).to(device)
+        backbone = DLinearMotionBackbone(input_len, output_len, feature_dim=feature_dim).to(device)
         backbone.train()
         for param in backbone.parameters():
             param.requires_grad_(True)
@@ -413,27 +451,23 @@ def build_random_backbones(config, num_backbones, device):
     return backbones
 
 
-def save_sequence_bank_npz(path, bank, step, logs, heldout_entries, feature_type="expmap", feature_dim=99):
+def save_motion_npz(path, seq_infos, motions, heldout_entries, step=0, logs=None, feature_type="expmap", feature_dim=99, tag=""):
     ensure_dir(os.path.dirname(path))
-
-    payload = bank.get_all()
-    seq_infos = payload["seq_infos"]
-    synthetic_motions = payload["synthetic_motions"].numpy().astype(np.float32)
 
     subjects = []
     actions = []
     trials = []
     lengths = []
     raw_paths = []
-    motions = []
+    output_motions = []
 
-    for info, motion in zip(seq_infos, synthetic_motions):
+    for info, motion in zip(seq_infos, motions):
         subjects.append(info["subject"])
         actions.append(info["action"])
         trials.append(info["trial"])
         lengths.append(motion.shape[0])
-        raw_paths.append("distilled://step_{}/{}".format(step, info["key"]))
-        motions.append(motion)
+        raw_paths.append("{}://{}".format(tag or "motion_bank", info["key"]))
+        output_motions.append(np.asarray(motion, dtype=np.float32))
 
     for entry in heldout_entries:
         subjects.append(entry["subject"])
@@ -441,10 +475,10 @@ def save_sequence_bank_npz(path, bank, step, logs, heldout_entries, feature_type
         trials.append(entry["trial"])
         lengths.append(entry["length"])
         raw_paths.append(entry["raw_path"])
-        motions.append(entry["motion"])
+        output_motions.append(np.asarray(entry["motion"], dtype=np.float32))
 
-    motion_array = np.empty(len(motions), dtype=object)
-    for idx, motion in enumerate(motions):
+    motion_array = np.empty(len(output_motions), dtype=object)
+    for idx, motion in enumerate(output_motions):
         motion_array[idx] = motion
 
     np.savez(
@@ -458,7 +492,24 @@ def save_sequence_bank_npz(path, bank, step, logs, heldout_entries, feature_type
         feature_type=np.array(feature_type, dtype=object),
         feature_dim=np.array(feature_dim, dtype=np.int64),
         distill_step=np.array(step, dtype=np.int64),
-        distill_logs=np.array(logs, dtype=object),
+        distill_logs=np.array(logs or [], dtype=object),
+    )
+
+
+def save_sequence_bank_npz(path, bank, step, logs, heldout_entries, feature_type="expmap", feature_dim=99):
+    payload = bank.get_all()
+    seq_infos = payload["seq_infos"]
+    synthetic_motions = payload["synthetic_motions"].numpy().astype(np.float32)
+    save_motion_npz(
+        path=path,
+        seq_infos=seq_infos,
+        motions=synthetic_motions,
+        heldout_entries=heldout_entries,
+        step=step,
+        logs=logs,
+        feature_type=feature_type,
+        feature_dim=feature_dim,
+        tag="distilled_step_{}".format(step),
     )
 
 
@@ -492,20 +543,27 @@ def train_distillation():
     ).to(device)
     bank.project_valid_rfft()
 
-    backbones = build_random_backbones(simlpe_config, cfg.num_backbones, device)
+    backbones = build_random_dlinear_backbones(
+        input_len=input_len,
+        output_len=output_len,
+        feature_dim=cfg.feature_dim,
+        num_backbones=cfg.num_backbones,
+        device=device,
+    )
     optimizer = torch.optim.Adam(bank.parameters(), lr=cfg.lr_synthetic)
 
     output_dir = cfg.output_dir if os.path.isabs(cfg.output_dir) else os.path.join(root_dir(), cfg.output_dir)
     save_path = os.path.join(output_dir, cfg.save_name)
-
     logs = []
 
+    print("========== Distillation: DLinear GM ==========")
     print("Device:", device)
     print("Num training sequences:", len(sampler.keys))
     print("Input length:", input_len, "Output length:", output_len)
     print("lambda_harm:", cfg.lambda_harm, "lambda_grad:", cfg.lambda_grad)
     print("lambda_vel:", cfg.lambda_vel, "lambda_pred:", cfg.lambda_pred)
-    print("Backbone reinit interval:", cfg.backbone_reinit_interval)
+    print("use_hdt_filter:", cfg.use_hdt_filter, "top_k:", cfg.top_k)
+    print("Backbone: DLinear")
     print("Synthetic initialization: real sequence crop")
     print("Save path:", save_path)
 
@@ -521,48 +579,37 @@ def train_distillation():
         per_seq_vels = []
         harmonic_counts = []
 
-        # Strict sequence-level loss:
-        # each real_sub_i only compares to syn_sub_i.
-        # total_loss is just an average of independent per-sequence losses.
         for i in range(real_sub_batch.shape[0]):
             real_sub = real_sub_batch[i : i + 1]
             syn_sub = syn_sub_batch[i : i + 1]
 
-            l_harm, real_h, syn_h, harmonic_mask = harmonic_filter_and_loss(
-                real_sub,
-                syn_sub,
-                top_k=cfg.top_k,
-            )
+            if cfg.use_hdt_filter:
+                l_harm, real_h, syn_h, harmonic_mask = harmonic_filter_and_loss(real_sub, syn_sub, top_k=cfg.top_k)
+                harmonic_count = int(harmonic_mask.sum().detach().cpu())
+            else:
+                l_harm = torch.zeros((), device=device)
+                real_h = real_sub
+                syn_h = syn_sub
+                harmonic_count = 0
 
             real_past, real_future = make_windows_from_subseries(
-                real_h,
-                input_len,
-                output_len,
-                window_mode=cfg.window_mode,
+                real_h, input_len, output_len, window_mode=cfg.window_mode
             )
             syn_past, syn_future = make_windows_from_subseries(
-                syn_h,
-                input_len,
-                output_len,
-                window_mode=cfg.window_mode,
+                syn_h, input_len, output_len, window_mode=cfg.window_mode
             )
 
             grad_losses = [
                 compute_gradient_matching_loss_single(
-                    backbone,
-                    real_past,
-                    real_future,
-                    syn_past,
-                    syn_future,
-                    output_len,
+                    backbone, real_past, real_future, syn_past, syn_future, output_len
                 )
                 for backbone in backbones
             ]
             l_grad = torch.stack(grad_losses).mean()
 
             syn_pred = backbones[0](syn_past, output_len=output_len)
-            l_pred_syn = prediction_loss(syn_pred, syn_future)
-            l_vel_syn = velocity_loss(syn_pred, syn_future)
+            l_pred_syn = prediction_loss_expmap(syn_pred, syn_future)
+            l_vel_syn = velocity_loss_expmap(syn_pred, syn_future)
 
             loss_i = (
                 cfg.lambda_harm * l_harm
@@ -576,7 +623,7 @@ def train_distillation():
             per_seq_grads.append(cfg.lambda_grad * l_grad.detach())
             per_seq_preds.append(cfg.lambda_pred * l_pred_syn.detach())
             per_seq_vels.append(cfg.lambda_vel * l_vel_syn.detach())
-            harmonic_counts.append(int(harmonic_mask.sum().detach().cpu()))
+            harmonic_counts.append(harmonic_count)
 
         total_loss = torch.stack(per_seq_losses).mean()
 
@@ -632,7 +679,62 @@ def train_distillation():
         feature_dim=cfg.feature_dim,
     )
 
-    print("Saved distilled sequence-level synthetic bank to {}".format(save_path))
+    print("Saved distilled DLinear sequence-level synthetic bank to {}".format(save_path))
+    return save_path
+
+
+def sample_random_concatenated(seq, synthetic_len, num_pieces):
+    seq_len = seq.shape[0]
+    if num_pieces <= 1:
+        start = random.randint(0, seq_len - synthetic_len)
+        return seq[start : start + synthetic_len].astype(np.float32)
+
+    base = synthetic_len // num_pieces
+    rem = synthetic_len % num_pieces
+    piece_lengths = [base + (1 if i < rem else 0) for i in range(num_pieces)]
+
+    pieces = []
+    for piece_len in piece_lengths:
+        if piece_len <= 0:
+            continue
+        start = random.randint(0, seq_len - piece_len)
+        pieces.append(seq[start : start + piece_len])
+    return np.concatenate(pieces, axis=0).astype(np.float32)
+
+
+def create_random_baseline_npz(num_pieces, name):
+    cfg = DistillConfig()
+
+    random.seed(cfg.seed)
+    np.random.seed(cfg.seed)
+
+    sampler = SequenceRealSubseriesSampler(
+        cfg.data_path,
+        synthetic_len=cfg.synthetic_len,
+        include_subjects=DISTILL_SUBJECTS,
+        heldout_subjects=HELDOUT_SUBJECTS,
+    )
+
+    motions = []
+    for info in sampler.seq_infos:
+        seq = sampler.by_key[info["key"]]
+        motion = sample_random_concatenated(seq, cfg.synthetic_len, num_pieces=num_pieces)
+        motions.append(motion)
+
+    output_dir = cfg.output_dir if os.path.isabs(cfg.output_dir) else os.path.join(root_dir(), cfg.output_dir)
+    save_path = os.path.join(output_dir, "h36m_expmap_sequences_{}.npz".format(name))
+
+    save_motion_npz(
+        save_path,
+        seq_infos=sampler.seq_infos,
+        motions=motions,
+        heldout_entries=sampler.get_heldout_entries(),
+        step=0,
+        logs=[{"baseline": name, "num_pieces": num_pieces, "synthetic_len": cfg.synthetic_len}],
+        feature_dim=cfg.feature_dim,
+        tag=name,
+    )
+    print("Saved random baseline {} to {}".format(name, save_path))
     return save_path
 
 
@@ -674,14 +776,6 @@ class H36MExpmapWindowDataset(Dataset):
 
 
 class SequenceWindowBatchSampler(Sampler):
-    """
-    Yield batches from one sequence at a time.
-
-    If a sequence has 41 windows and batch_size=64, it yields one batch of 41.
-    If a sequence has 130 windows and batch_size=64, it yields 64, 64, 2.
-    No batch mixes windows from different sequences.
-    """
-
     def __init__(self, dataset, batch_size, shuffle_sequences=True, shuffle_windows=True):
         self.dataset = dataset
         self.batch_size = batch_size
@@ -754,9 +848,11 @@ class H36MExpmapEvalDataset(Dataset):
         return window[: self.input_len], motion_xyz32[self.input_len :]
 
 
-def evaluate_mpjpe(model, npz_path, subjects, config):
+def evaluate_mpjpe_dlinear(model, npz_path, subjects, config, device):
     input_len = config.motion.h36m_input_length
     output_len = config.motion.h36m_target_length_eval
+    train_step_len = config.motion.h36m_target_length_train
+
     dataset = H36MExpmapEvalDataset(npz_path, subjects, input_len, output_len)
     dataloader = DataLoader(
         dataset,
@@ -772,30 +868,26 @@ def evaluate_mpjpe(model, npz_path, subjects, config):
     model.eval()
 
     for motion_input_expmap, motion_target_xyz32 in dataloader:
-        motion_input_expmap = motion_input_expmap.cuda()
+        motion_input_expmap = motion_input_expmap.to(device)
         motion_target_xyz32 = motion_target_xyz32.float()
         batch_size = motion_input_expmap.shape[0]
         num_samples += batch_size
 
         outputs = []
-        current_input = expmap_to_simlpe_xyz66(motion_input_expmap)
-        step = config.motion.h36m_target_length_train
-        num_step = 1 if step == output_len else output_len // step + 1
+        current_input = motion_input_expmap
+        num_step = 1 if train_step_len == output_len else output_len // train_step_len + 1
 
         with torch.no_grad():
             for _ in range(num_step):
-                output_xyz66 = model.forward_xyz66(current_input, output_len=step)
-                outputs.append(output_xyz66.detach().cpu())
-                current_input = torch.cat([current_input[:, step:], output_xyz66], dim=1)
+                pred_expmap = model(current_input, output_len=train_step_len)
+                outputs.append(pred_expmap.detach().cpu())
+                current_input = torch.cat([current_input[:, train_step_len:], pred_expmap], dim=1)
 
-        pred_xyz66 = torch.cat(outputs, dim=1)[:, :output_len]
-        pred_rot = pred_xyz66.reshape(batch_size, output_len, 22, 3)
-        motion_pred = motion_target_xyz32.clone().reshape(batch_size, output_len, 32, 3)
-        motion_gt = motion_target_xyz32.clone().reshape(batch_size, output_len, 32, 3)
-        motion_pred[:, :, JOINT_USED_XYZ] = pred_rot
-        motion_pred[:, :, JOINT_TO_IGNORE] = motion_pred[:, :, JOINT_EQUAL]
+        pred_expmap = torch.cat(outputs, dim=1)[:, :output_len]
+        motion_pred_xyz32 = expmap_to_xyz32(pred_expmap).reshape(batch_size, output_len, 32, 3) / 1000.0
+        motion_gt_xyz32 = motion_target_xyz32.reshape(batch_size, output_len, 32, 3)
 
-        mpjpe = torch.sum(torch.mean(torch.norm(motion_pred * 1000 - motion_gt * 1000, dim=3), dim=2), dim=0)
+        mpjpe = torch.sum(torch.mean(torch.norm(motion_pred_xyz32 * 1000 - motion_gt_xyz32 * 1000, dim=3), dim=2), dim=0)
         sums += mpjpe.cpu().numpy()
 
     mpjpe_by_frame = sums / num_samples
@@ -805,11 +897,13 @@ def evaluate_mpjpe(model, npz_path, subjects, config):
     return [round(ret[key], 1) for key in RESULT_KEYS]
 
 
-def train_step(model, past_expmap, future_expmap, optimizer, output_len):
-    pred_xyz66 = model(past_expmap.cuda(), output_len=output_len)
-    gt_xyz66 = expmap_to_simlpe_xyz66(future_expmap.cuda())
-    loss_pred = F.mse_loss(pred_xyz66, gt_xyz66)
-    loss_vel = velocity_loss(pred_xyz66, future_expmap.cuda())
+def train_step_dlinear(model, past_expmap, future_expmap, optimizer, output_len, device):
+    past_expmap = past_expmap.to(device)
+    future_expmap = future_expmap.to(device)
+
+    pred_expmap = model(past_expmap, output_len=output_len)
+    loss_pred = prediction_loss_expmap(pred_expmap, future_expmap)
+    loss_vel = velocity_loss_expmap(pred_expmap, future_expmap)
     loss = loss_pred + loss_vel
 
     optimizer.zero_grad()
@@ -819,24 +913,25 @@ def train_step(model, past_expmap, future_expmap, optimizer, output_len):
     return loss.item(), loss_pred.item(), loss_vel.item()
 
 
-def train_and_evaluate(train_npz_path):
+def train_and_evaluate(train_npz_path, run_name):
     cfg = TrainConfig()
-    cfg.train_npz_path = train_npz_path
 
     random.seed(cfg.seed)
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     config = build_simlpe_config()
     input_len = config.motion.h36m_input_length
     output_len = config.motion.h36m_target_length_train
 
-    model = SiMLPeMotionBackbone(config).cuda()
+    model = DLinearMotionBackbone(input_len, output_len, feature_dim=99).to(device)
     model.train()
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
     train_dataset = H36MExpmapWindowDataset(
-        cfg.train_npz_path,
+        train_npz_path,
         cfg.train_subjects,
         input_len,
         output_len,
@@ -855,14 +950,19 @@ def train_and_evaluate(train_npz_path):
         pin_memory=True,
     )
 
-    print("Train batches are sequence-pure: one batch contains windows from one synthetic sequence only.")
+    print("========== Train/Eval DLinear: {} ==========".format(run_name))
+    print("Train NPZ:", train_npz_path)
+    print("Train batches are sequence-pure: one batch contains windows from one sequence only.")
     print("Adaptive batch sampler:", "batch_size <=", cfg.batch_size, "num_batches =", len(train_batch_sampler))
 
-    log_path = resolve_path(cfg.log_path)
-    ensure_dir(os.path.dirname(log_path))
+    log_dir = resolve_path(cfg.log_dir)
+    ensure_dir(log_dir)
+    log_path = os.path.join(log_dir, "train_eval_dlinear_{}.txt".format(run_name))
     acc_log = open(log_path, "w")
+    acc_log.write("Run : {}\n".format(run_name))
     acc_log.write("Seed : {}\n".format(cfg.seed))
-    acc_log.write("Train NPZ : {}\n".format(cfg.train_npz_path))
+    acc_log.write("Backbone : DLinear\n")
+    acc_log.write("Train NPZ : {}\n".format(train_npz_path))
     acc_log.write("Test NPZ : {}\n".format(cfg.test_npz_path))
 
     nb_iter = 0
@@ -870,19 +970,19 @@ def train_and_evaluate(train_npz_path):
 
     while nb_iter < cfg.total_iters:
         for past_expmap, future_expmap in train_loader:
-            loss, loss_pred, loss_vel = train_step(model, past_expmap, future_expmap, optimizer, output_len)
+            loss, loss_pred, loss_vel = train_step_dlinear(model, past_expmap, future_expmap, optimizer, output_len, device)
             nb_iter += 1
             avg_loss += loss
 
             if nb_iter % cfg.print_every == 0:
-                print("train iter {} loss={:.6f}".format(nb_iter, avg_loss / cfg.print_every))
+                print("[{}] train iter {} loss={:.6f}".format(run_name, nb_iter, avg_loss / cfg.print_every))
                 avg_loss = 0.0
 
             if nb_iter == cfg.total_iters:
                 break
 
-    metrics = evaluate_mpjpe(model, cfg.test_npz_path, cfg.test_subjects, config)
-    print("Final MPJPE {}: {}".format(RESULT_KEYS, metrics))
+    metrics = evaluate_mpjpe_dlinear(model, cfg.test_npz_path, cfg.test_subjects, config, device)
+    print("[{}] Final MPJPE {}: {}".format(run_name, RESULT_KEYS, metrics))
     acc_log.write("final\n{}\n".format(" ".join(str(v) for v in metrics)))
     acc_log.flush()
     acc_log.close()
@@ -892,8 +992,39 @@ def train_and_evaluate(train_npz_path):
 
 
 def main():
+    cfg = DistillConfig()
+
     distilled_path = train_distillation()
-    train_and_evaluate(distilled_path)
+
+    random_complete_path = create_random_baseline_npz(num_pieces=1, name="random_complete_len{}".format(cfg.synthetic_len))
+    random_20pieces_path = create_random_baseline_npz(num_pieces=20, name="random_20pieces_len{}".format(cfg.synthetic_len))
+    random_50pieces_path = create_random_baseline_npz(num_pieces=50, name="random_50pieces_len{}".format(cfg.synthetic_len))
+
+    runs = [
+        ("distilled_dlinear_gm", distilled_path),
+        ("random_complete", random_complete_path),
+        ("random_20pieces", random_20pieces_path),
+        ("random_50pieces", random_50pieces_path),
+    ]
+
+    results = {}
+    for run_name, path in runs:
+        metrics = train_and_evaluate(path, run_name)
+        results[run_name] = metrics
+
+    print("\n========== Unified Final Summary ==========")
+    print("Frames:", " ".join(RESULT_KEYS))
+    for run_name, metrics in results.items():
+        print("{}: {}".format(run_name, " ".join(str(v) for v in metrics)))
+
+    summary_dir = resolve_path("logs")
+    ensure_dir(summary_dir)
+    summary_path = os.path.join(summary_dir, "summary_dlinear_distill_vs_random.txt")
+    with open(summary_path, "w") as f:
+        f.write("Frames: {}\n".format(" ".join(RESULT_KEYS)))
+        for run_name, metrics in results.items():
+            f.write("{}: {}\n".format(run_name, " ".join(str(v) for v in metrics)))
+    print("Saved unified summary to {}".format(summary_path))
 
 
 if __name__ == "__main__":

@@ -47,7 +47,7 @@ mamba activate motiondd
 # 对Dlinear做类似的测试
 # nohup python run_dlinear_seed_sweep_full_random_gm.py > run_dlinear_seed_sweep_full_random_gm.log 2>&1 &
 # 修正一下做做尝试
-# nohup python run_dlinear_seed_sweep_full_random_gm_protocol_fixed.py > run_dlinear_seed_sweep_full_random_gm_protocol_fixed.log 2>&1 &
+nohup python run_dlinear_seed_sweep_full_random_gm_protocol_fixed.py > run_dlinear_seed_sweep_full_random_gm_protocol_fixed.log 2>&1 &
 
 # 一个残差，不确定有用
 # nohup python run_map_gm_middle_anchor.py > run_map_gm_middle_anchor.log 2>&1 &
@@ -55,8 +55,3 @@ mamba activate motiondd
 # 在纯净蒸馏的基础上加强动作约束
 
 #nohup python run_sequence_simple_distill_and_train_300weight.py > run_sequence_simple_distill_and_train_300weight.log 2>&1 &
-
-
-# 检查一下Dlinear的结果
-# run_dlinear_msweep_plus.py
-nohup python run_dlinear_msweep_plus.py > run_dlinear_msweep_plus.log 2>&1 &
