@@ -59,4 +59,14 @@ mamba activate motiondd
 
 # 检查一下Dlinear的结果
 # run_dlinear_msweep_plus.py
-nohup python run_dlinear_msweep_plus.py > run_dlinear_msweep_plus.log 2>&1 &
+# nohup python run_dlinear_msweep_plus.py > run_dlinear_msweep_plus.log 2>&1 &
+
+
+
+nohup python run_dlinear_msweep_len200.py  > logs/nohup_dlinear_msweep_len200.out 2>&1 &
+#nohup python run_dlinear_msweep_len70.py  > logs/nohup_dlinear_msweep_len70.out 2>&1 &
+# 下面这个执行完成了
+#nohup python run_dlinear_msweep_len100_batchmix.py  > logs/nohup_dlinear_msweep_len100_batchmix.out 2>&1 &
+
+# 先不跑下面这个
+# nohup python methods/smoke_test/run_dlinear_msweep_in20_out10_len40_batchmix.py  logs/nohup_dlinear_msweep_in20_out10_len40_batchmix.out 2>&1 &

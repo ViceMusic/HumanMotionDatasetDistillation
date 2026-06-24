@@ -1,0 +1,50 @@
+Running 30 experiments for DL-MSweep-Len70 with max_workers=45
+Seeds: [888, 999, 1234, 2026, 3407]
+Summary log: /home/user/workspace/HumanMotionDatasetDistillation/methods/smoke_test/logs/dlinear_msweep_len70/summary_mean_std.txt
+Finished: full_seed888 status= failed metrics= None
+Finished: full_seed999 status= failed metrics= None
+Finished: full_seed1234 status= failed metrics= None
+Finished: full_seed2026 status= failed metrics= None
+Finished: full_seed3407 status= failed metrics= None
+Finished: distilled_dlinear_gm_seed888 status= failed metrics= None
+Finished: distilled_dlinear_gm_seed999 status= failed metrics= None
+Finished: distilled_dlinear_gm_seed1234 status= failed metrics= None
+Finished: distilled_dlinear_gm_seed2026 status= failed metrics= None
+Finished: distilled_dlinear_gm_seed3407 status= failed metrics= None
+Finished: distilled_dlinear_gm_pure_seed888 status= failed metrics= None
+Finished: distilled_dlinear_gm_pure_seed999 status= failed metrics= None
+Finished: distilled_dlinear_gm_pure_seed1234 status= failed metrics= None
+Finished: distilled_dlinear_gm_pure_seed2026 status= failed metrics= None
+Finished: distilled_dlinear_gm_pure_seed3407 status= failed metrics= None
+Finished: distilled_dlinear_gm_strong_motion_seed888 status= failed metrics= None
+Finished: distilled_dlinear_gm_strong_motion_seed999 status= failed metrics= None
+Finished: distilled_dlinear_gm_strong_motion_seed1234 status= failed metrics= None
+Finished: distilled_dlinear_gm_strong_motion_seed2026 status= failed metrics= None
+Finished: distilled_dlinear_gm_strong_motion_seed3407 status= failed metrics= None
+Finished: random_complete_seed888 status= failed metrics= None
+Finished: random_complete_seed999 status= failed metrics= None
+Finished: random_complete_seed1234 status= failed metrics= None
+Finished: random_complete_seed2026 status= failed metrics= None
+Finished: random_complete_seed3407 status= failed metrics= None
+Finished: random_20pieces_seed888 status= failed metrics= None
+Finished: random_20pieces_seed999 status= failed metrics= None
+Finished: random_20pieces_seed1234 status= failed metrics= None
+Finished: random_20pieces_seed2026 status= failed metrics= None
+Finished: random_20pieces_seed3407 status= failed metrics= None
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+  File "/home/user/miniforge3/envs/motiondd/lib/python3.10/multiprocessing/spawn.py", line 116, in spawn_main
+    exitcode = _main(fd, parent_sentinel)
+  File "/home/user/miniforge3/envs/motiondd/lib/python3.10/multiprocessing/spawn.py", line 126, in _main
+    self = reduction.pickle.load(from_parent)
+_pickle.UnpicklingError: pickle data was truncated
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+  File "/home/user/miniforge3/envs/motiondd/lib/python3.10/multiprocessing/spawn.py", line 116, in spawn_main
+    exitcode = _main(fd, parent_sentinel)
+  File "/home/user/miniforge3/envs/motiondd/lib/python3.10/multiprocessing/spawn.py", line 126, in _main
+    self = reduction.pickle.load(from_parent)
+_pickle.UnpicklingError: pickle data was truncated
+Done. Summary written to /home/user/workspace/HumanMotionDatasetDistillation/methods/smoke_test/logs/dlinear_msweep_len70/summary_mean_std.txt
+/home/user/miniforge3/envs/motiondd/lib/python3.10/multiprocessing/resource_tracker.py:224: UserWarning: resource_tracker: There appear to be 55 leaked semaphore objects to clean up at shutdown
+  warnings.warn('resource_tracker: There appear to be %d '

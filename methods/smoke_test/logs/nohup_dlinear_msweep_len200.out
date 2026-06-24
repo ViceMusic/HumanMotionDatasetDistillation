@@ -1,0 +1,3 @@
+Running 30 experiments for DL-MSweep-Len200 with max_workers=45
+Seeds: [888, 999, 1234, 2026, 3407]
+Summary log: /home/user/workspace/HumanMotionDatasetDistillation/methods/smoke_test/logs/dlinear_msweep_len200/summary_mean_std.txt
