@@ -23,6 +23,14 @@ runs/
 *.log
 events.out.tfevents.*
 
+# numpy
+*.npy
+*.npz
+
+# logs
+*.log
+*.txt
+
 # Checkpoints
 checkpoint/
 checkpoints/
